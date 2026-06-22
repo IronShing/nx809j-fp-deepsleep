@@ -52,10 +52,16 @@ jobs:
         run: |
           export ARCH=arm64 LLVM=1 LLVM_IAS=1
           make gki_defconfig
-          # enable the configs the kprobe module needs (already on in GKI, belt+braces)
-          ./scripts/config -e KPROBES -e MODULES -e KALLSYMS_ALL || true
+          # KCFI is the load-time gatekeeper: this kernel CFI-checks do_one_initcall,
+          # so a non-CFI module panics on load before the kprobe ever runs (found by
+          # the device build session). 6.12 KCFI needs NO LTO — keep CFI_CLANG on,
+          # LTO off (lighter CI build, still CFI-tagged init).
+          ./scripts/config -e KPROBES -e MODULES -e KALLSYMS_ALL \
+            -e CFI_CLANG -d LTO_CLANG_FULL -d LTO_CLANG_THIN -e LTO_NONE || true
           make olddefconfig
-          make modules_prepare prepare scripts -j"$(nproc)"
+          grep -E "CONFIG_CFI_CLANG|CONFIG_LTO_NONE" .config || true
+          # full build (not just modules_prepare) so Module.symvers carries real CRCs
+          make Image modules_prepare -j"$(nproc)"
 
       - name: Build the module
         run: |
