@@ -1,26 +1,29 @@
 name: Build fp_deepsleep.ko
 
-# Reproducible build of the deep-doze FOD-arming kprobe module against the
-# Android GKI android16-6.12 common kernel (same GKI base as the device's
-# 6.12.23-android16-OP-WILD). The kprobe module only references core, KMI-stable
-# symbols (register_kprobe / unregister_kprobe / printk), so a module built
-# against gki_defconfig loads on the OP-WILD kernel (which also tolerates
-# vermagic mismatch — proven by the stock vendor .kos).
+# Reproducible build of a LOADABLE custom KCFI module for NX809J
+# (6.12.23-android16-OP-WILD). Encodes the full load gauntlet (see README):
+# MODVERSIONS + KCFI + CFI integer-normalize + MODULE_SIG(sha256) + module_layout
+# CRC patch. Builds against GKI android16-6.12 (same GKI base as the device).
 #
-# For a byte-exact CRC match, set KERNEL_SRC_REPO/REF to the WildKernels/Coding-BR
-# OnePlus kernel tree the OP-WILD Image was built from and reuse its Module.symvers.
+# NOTE: the deep-doze FP *fix* via this module is DISPROVEN (README) — the module
+# is now a log-only probe / loadable-module template. This CI exists to keep the
+# loadable-KCFI capability reproducible for future kernel RE on this device.
 
 on:
   workflow_dispatch:
     inputs:
       kernel_ref:
-        description: "GKI common branch/tag to build against"
+        description: "GKI common branch/tag"
         type: string
         default: "android16-6.12"
       clang_version:
-        description: "AOSP prebuilt clang dir under prebuilts/clang/host/linux-x86"
+        description: "AOSP prebuilt clang dir"
         type: string
         default: "clang-r547379"
+      module_layout_crc:
+        description: "device module_layout CRC to patch to (NX809J = 0xe976b219)"
+        type: string
+        default: "0xe976b219"
 
 jobs:
   build:
@@ -30,47 +33,61 @@ jobs:
         uses: actions/checkout@v4
         with: { path: mod }
 
-      - name: Install deps
+      - name: Install deps (incl. libdw for gendwarfksyms/MODVERSIONS)
         run: |
           sudo apt-get update
-          sudo apt-get install -y bc bison flex libssl-dev libelf-dev cpio git
+          sudo apt-get install -y bc bison flex libssl-dev libelf-dev libdw-dev elfutils cpio git
 
-      - name: Fetch GKI common kernel source
+      - name: Fetch GKI common kernel + AOSP clang
         run: |
           git clone --depth 1 -b "${{ inputs.kernel_ref }}" \
             https://android.googlesource.com/kernel/common kernel
-          echo "KDIR=$PWD/kernel" >> "$GITHUB_ENV"
-
-      - name: Fetch AOSP prebuilt clang
-        run: |
           git clone --depth 1 \
             https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 clangdir
+          echo "KDIR=$PWD/kernel" >> "$GITHUB_ENV"
           echo "PATH=$PWD/clangdir/${{ inputs.clang_version }}/bin:$PATH" >> "$GITHUB_ENV"
 
-      - name: Prepare kernel (gki_defconfig + modules_prepare)
+      - name: Configure (full gauntlet) + full build for Module.symvers
         working-directory: kernel
         run: |
           export ARCH=arm64 LLVM=1 LLVM_IAS=1
           make gki_defconfig
-          # KCFI is the load-time gatekeeper: this kernel CFI-checks do_one_initcall,
-          # so a non-CFI module panics on load before the kprobe ever runs (found by
-          # the device build session). 6.12 KCFI needs NO LTO — keep CFI_CLANG on,
-          # LTO off (lighter CI build, still CFI-tagged init).
+          # The five gates that make a module LOAD on this kernel:
           ./scripts/config -e KPROBES -e MODULES -e KALLSYMS_ALL \
-            -e CFI_CLANG -d LTO_CLANG_FULL -d LTO_CLANG_THIN -e LTO_NONE || true
+            -e MODVERSIONS \
+            -e CFI_CLANG -d LTO_CLANG_FULL -d LTO_CLANG_THIN -e LTO_NONE \
+            -e CFI_ICALL_NORMALIZE_INTEGERS \
+            -e MODULE_SIG -e MODULE_SIG_SHA256 -d MODULE_SIG_SHA1 -d MODULE_SIG_FORCE
           make olddefconfig
-          grep -E "CONFIG_CFI_CLANG|CONFIG_LTO_NONE" .config || true
-          # full build (not just modules_prepare) so Module.symvers carries real CRCs
-          make Image modules_prepare -j"$(nproc)"
+          # olddefconfig updates .config but not auto.conf — modules_prepare drives the flags
+          make modules_prepare prepare scripts -j"$(nproc)"
+          grep -E "CFI_CLANG|NORMALIZE_INTEGERS|MODVERSIONS|MODULE_SIG=|LTO_NONE|SIG_SHA256" .config || true
+          # full build → Module.symvers (symbol CRCs)
+          make Image -j"$(nproc)"
 
       - name: Build the module
         run: |
           export ARCH=arm64 LLVM=1 LLVM_IAS=1
           make -C "$KDIR" M="$PWD/mod" modules -j"$(nproc)"
-          ls -l mod/*.ko
-          "$KDIR"/scripts/extract-vermagic mod/fp_deepsleep.ko 2>/dev/null || \
-            modinfo mod/fp_deepsleep.ko 2>/dev/null || \
-            strings mod/fp_deepsleep.ko | grep -m1 vermagic || true
+          modinfo mod/fp_deepsleep.ko 2>/dev/null | grep -E "vermagic|name" || true
+
+      - name: Patch module_layout CRC to the device value
+        run: |
+          python3 - "$KDIR" mod/fp_deepsleep.ko "${{ inputs.module_layout_crc }}" <<'PY'
+          import sys, struct, subprocess, re
+          kdir, ko, want = sys.argv[1], sys.argv[2], int(sys.argv[3], 16)
+          data = bytearray(open(ko, 'rb').read())
+          # __versions entries: <u32 crc><56-byte name>; find module_layout, patch crc
+          name = b"module_layout"
+          patched = 0
+          for m in re.finditer(re.escape(name), bytes(data)):
+              off = m.start() - 4
+              if off >= 0:
+                  struct.pack_into("<I", data, off, want)
+                  patched += 1
+          open(ko, 'wb').write(data)
+          print(f"patched module_layout -> {hex(want)} ({patched} entr{'y' if patched==1 else 'ies'})")
+          PY
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
