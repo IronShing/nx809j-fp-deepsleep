@@ -1,0 +1,73 @@
+name: Build fp_deepsleep.ko
+
+# Reproducible build of the deep-doze FOD-arming kprobe module against the
+# Android GKI android16-6.12 common kernel (same GKI base as the device's
+# 6.12.23-android16-OP-WILD). The kprobe module only references core, KMI-stable
+# symbols (register_kprobe / unregister_kprobe / printk), so a module built
+# against gki_defconfig loads on the OP-WILD kernel (which also tolerates
+# vermagic mismatch — proven by the stock vendor .kos).
+#
+# For a byte-exact CRC match, set KERNEL_SRC_REPO/REF to the WildKernels/Coding-BR
+# OnePlus kernel tree the OP-WILD Image was built from and reuse its Module.symvers.
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_ref:
+        description: "GKI common branch/tag to build against"
+        type: string
+        default: "android16-6.12"
+      clang_version:
+        description: "AOSP prebuilt clang dir under prebuilts/clang/host/linux-x86"
+        type: string
+        default: "clang-r547379"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout module
+        uses: actions/checkout@v4
+        with: { path: mod }
+
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc bison flex libssl-dev libelf-dev cpio git
+
+      - name: Fetch GKI common kernel source
+        run: |
+          git clone --depth 1 -b "${{ inputs.kernel_ref }}" \
+            https://android.googlesource.com/kernel/common kernel
+          echo "KDIR=$PWD/kernel" >> "$GITHUB_ENV"
+
+      - name: Fetch AOSP prebuilt clang
+        run: |
+          git clone --depth 1 \
+            https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 clangdir
+          echo "PATH=$PWD/clangdir/${{ inputs.clang_version }}/bin:$PATH" >> "$GITHUB_ENV"
+
+      - name: Prepare kernel (gki_defconfig + modules_prepare)
+        working-directory: kernel
+        run: |
+          export ARCH=arm64 LLVM=1 LLVM_IAS=1
+          make gki_defconfig
+          # enable the configs the kprobe module needs (already on in GKI, belt+braces)
+          ./scripts/config -e KPROBES -e MODULES -e KALLSYMS_ALL || true
+          make olddefconfig
+          make modules_prepare prepare scripts -j"$(nproc)"
+
+      - name: Build the module
+        run: |
+          export ARCH=arm64 LLVM=1 LLVM_IAS=1
+          make -C "$KDIR" M="$PWD/mod" modules -j"$(nproc)"
+          ls -l mod/*.ko
+          "$KDIR"/scripts/extract-vermagic mod/fp_deepsleep.ko 2>/dev/null || \
+            modinfo mod/fp_deepsleep.ko 2>/dev/null || \
+            strings mod/fp_deepsleep.ko | grep -m1 vermagic || true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: fp_deepsleep-ko
+          path: mod/fp_deepsleep.ko
